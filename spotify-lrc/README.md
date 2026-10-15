@@ -8,11 +8,14 @@ Ya phir **manual search** se song name + artist likh kar lyrics lo.
 ## Kaise kaam karta hai
 
 1. Spotify link se track list **bina kisi API key ke** nikalta hai (Spotify ke public embed pages se — koi login, koi Premium, koi sp_dc cookie nahi)
-2. Har track ke liye **lrclib.net** ka free API hit hota hai (koi key nahi chahiye)
-3. Synced lyrics mil jayein to `.lrc` file, warna plain lyrics / instrumental / not-found
+2. Har track ke liye **3 free sources** ek ke baad ek try hote hain (koi key/cookie nahi chahiye):
+   - **LRCLIB** — sab se bara free synced-lyrics database (crowd-sourced)
+   - **Apple Music** (BetterLyrics) — Apple ke synced lyrics, TTML format se convert hote hain
+   - **KuGou Music** — Chinese/Western catalog ke synced LRC
+3. Synced lyrics mil jayein to `.lrc` file (badge me source bhi likha aata hai: LRCLIB / Apple Music / KuGou), warna plain lyrics / instrumental / not-found
 4. Playlist ke saare lyrics ek click me **ZIP** me download
 
-lrclib ka poora database (~100GB) download karne ki **zaroorat nahi** — sab live API se aata hai.
+Kisi ka poora database download karne ki **zaroorat nahi** — sab live API se aata hai.
 
 ## Option 1: Local (1-click shortcut) ⚡
 
@@ -39,6 +42,6 @@ keyless mode hai jo hamesha kaam karta hai.
 
 ## Notes
 
-- lrclib free API hai isliye batch me har request ke darmiyan ~0.4s ka waqfa rakha gaya hai (unki guideline). Bari playlist me 1-2 minute lag sakte hain — progress bar dikhega.
-- Jo gaane lrclib me nahi milte unke liye "Not found" aayega.
+- Free APIs ka lihaaz rakha gaya hai: har request ke darmiyan waqfa + har request pe time limit, taake ek slow source poori playlist ko rok na de. Bari playlist me 1-2 minute lag sakte hain — progress bar dikhega.
+- Teeno sources me na mile to "Not found" aayega. Note: synced lyrics ki duniya me free + bina-login ka **sab se bara** option yahi chain hai — Spotify app wale lyrics (Musixmatch) ke liye login token (sp_dc) lazmi hai, uska koi free raasta nahi.
 - Server tumhari keys ya lyrics kahin save nahi karta.

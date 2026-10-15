@@ -11,28 +11,34 @@ const LRCLIB_THROTTLE_MS = 400; // lrclib asks clients to wait 200-500ms between
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-// Minimal https client (no auto gzip -> we send Accept-Encoding: identity)
+// Minimal https client (no auto gzip -> we send Accept-Encoding: identity).
+// NOTE: https.request's `timeout` option proved unreliable, so we enforce the
+// deadline with AbortSignal.timeout instead — guaranteed to fire.
 function httpsRequest(url, { method = 'GET', headers = {}, body = null, timeout = 20000 } = {}) {
   return new Promise((resolve, reject) => {
     const u = new URL(url);
-    const req = https.request({
-      hostname: u.hostname,
-      port: u.port || 443,
-      path: u.pathname + u.search,
-      method,
-      timeout,
-      headers: { 'Accept-Encoding': 'identity', ...headers },
-    }, (res) => {
-      let data = '';
-      res.on('data', (c) => (data += c));
-      res.on('end', () => {
-        let json = null;
-        try { json = data ? JSON.parse(data) : null; } catch (_) { /* not json */ }
-        resolve({ status: res.statusCode, headers: res.headers, text: data, json });
+    let req;
+    try {
+      req = https.request({
+        hostname: u.hostname,
+        port: u.port || 443,
+        path: u.pathname + u.search,
+        method,
+        headers: { 'Accept-Encoding': 'identity', ...headers },
+        signal: AbortSignal.timeout(timeout),
+      }, (res) => {
+        let data = '';
+        res.on('data', (c) => (data += c));
+        res.on('end', () => {
+          let json = null;
+          try { json = data ? JSON.parse(data) : null; } catch (_) { /* not json */ }
+          resolve({ status: res.statusCode, headers: res.headers, text: data, json });
+        });
       });
+    } catch (e) { reject(e); return; }
+    req.on('error', (e) => {
+      reject(e && e.name === 'AbortError' ? new Error('Request timed out') : e);
     });
-    req.on('timeout', () => { req.destroy(); reject(new Error('Request timed out')); });
-    req.on('error', reject);
     if (body) req.write(body);
     req.end();
   });
@@ -196,51 +202,204 @@ async function resolveViaEmbed(url) {
 // LRCLIB (free, no key)
 // ---------------------------------------------------------------------------
 
-function buildLrc(track, synced, plain, instrumental) {
+function lrcHeader(track) {
   const mm = String(Math.floor((track.duration_ms || 0) / 60000)).padStart(2, '0');
   const ss = String(Math.floor(((track.duration_ms || 0) % 60000) / 1000)).padStart(2, '0');
-  const head = `[ti:${track.name}]\n[ar:${track.artist}]\n[al:${track.album}]\n[length:${mm}:${ss}]\n`;
-  if (instrumental) return { status: 'instrumental', lrc: head + '[00:00.00] Instrumental\n' };
-  if (synced) return { status: 'synced', lrc: head + synced.trim() + '\n' };
-  if (plain) return { status: 'plain', lrc: head + plain.trim() + '\n' };
-  return { status: 'none', lrc: null };
+  return `[ti:${track.name}]\n[ar:${track.artist}]\n[al:${track.album}]\n[length:${mm}:${ss}]\n`;
 }
 
-async function fetchLyricsForTrack(track) {
-  const dur = Math.round((track.duration_ms || 0) / 1000);
-  const params = new URLSearchParams({ track_name: track.name, artist_name: track.artist });
-  if (track.album) params.set('album_name', track.album);
-  if (dur > 0) params.set('duration', String(dur));
+function buildLrc(track, synced, plain, instrumental, source) {
+  const head = lrcHeader(track);
+  // NOTE: synced/plain win over the instrumental flag — lrclib's flag is
+  // crowd-sourced and sometimes wrong (real lyrics exist but flag says true).
+  if (synced) return { status: 'synced', lrc: head + synced.trim() + '\n', source: source || null };
+  if (plain) return { status: 'plain', lrc: head + plain.trim() + '\n', source: source || null };
+  if (instrumental) return { status: 'instrumental', lrc: head + '[00:00.00] Instrumental\n', source: source || null };
+  return { status: 'none', lrc: null, source: null };
+}
 
+const firstArtist = (a) => String(a || '').split(',')[0].trim();
+
+function decodeEntities(s) {
+  return String(s || '')
+    .replace(/&apos;/g, "'").replace(/&#39;/g, "'")
+    .replace(/&quot;/g, '"').replace(/&amp;/g, '&')
+    .replace(/&lt;/g, '<').replace(/&gt;/g, '>');
+}
+
+// ---------------------------------------------------------------------------
+// Provider 1: LRCLIB (free, no key) — biggest free synced DB (crowd-sourced)
+// ---------------------------------------------------------------------------
+
+async function lrclibGet(name, artist, album, durSec) {
+  const params = new URLSearchParams({ track_name: name, artist_name: artist });
+  if (album) params.set('album_name', album);
+  if (durSec > 0) params.set('duration', String(durSec));
   const r = await httpsRequest('https://lrclib.net/api/get?' + params.toString(), {
     headers: { 'User-Agent': USER_AGENT },
   });
-  if (r.status === 200 && r.json) {
-    const d = r.json;
-    return buildLrc(track, d.syncedLyrics, d.plainLyrics, d.instrumental);
-  }
+  if (r.status === 200 && r.json) return r.json;
+  return null;
+}
 
-  // Fallback: keyword search, then pick the SMARTEST hit:
-  // prefer synced lyrics, then closest duration match to Spotify's duration.
-  const sq = new URLSearchParams({ q: track.name + ' ' + track.artist });
+// Keyword search fallback: pick the SMARTEST hit — synced first,
+// then closest duration match to Spotify's duration.
+async function lrclibSearchBest(track) {
+  const sq = new URLSearchParams({ q: track.name + ' ' + firstArtist(track.artist) });
   const s = await httpsRequest('https://lrclib.net/api/search?' + sq.toString(), {
     headers: { 'User-Agent': USER_AGENT },
   });
-  if (s.status === 200 && Array.isArray(s.json) && s.json.length) {
-    const wantDur = Math.round((track.duration_ms || 0) / 1000);
-    const scored = s.json.map((x) => {
-      let score = 0;
-      if (x.syncedLyrics) score += 1000;                       // synced beats plain, always
-      if (!x.instrumental && x.plainLyrics) score += 100;
-      if (wantDur > 0 && x.duration) score -= Math.min(Math.abs(x.duration - wantDur), 60); // closer duration wins
-      return { x, score };
-    }).sort((a, b) => b.score - a.score);
-    const hit = scored[0].x;
-    if (hit.syncedLyrics || hit.plainLyrics || hit.instrumental) {
-      return buildLrc(track, hit.syncedLyrics, hit.plainLyrics, hit.instrumental);
-    }
+  if (s.status !== 200 || !Array.isArray(s.json) || !s.json.length) return null;
+  const wantDur = Math.round((track.duration_ms || 0) / 1000);
+  const scored = s.json.map((x) => {
+    let score = 0;
+    if (x.syncedLyrics) score += 1000;                       // synced beats plain, always
+    if (!x.instrumental && x.plainLyrics) score += 100;
+    if (wantDur > 0 && x.duration) score -= Math.min(Math.abs(x.duration - wantDur), 60);
+    return { x, score };
+  }).sort((a, b) => b.score - a.score);
+  return scored[0].x;
+}
+
+// ---------------------------------------------------------------------------
+// Provider 2: BetterLyrics (free, no key for cached tracks)
+// Apple Music TTML synced lyrics. Needs song+artist+album+duration for a
+// cache hit; returns HTTP 401 when the track isn't cached (treated as miss).
+// ---------------------------------------------------------------------------
+
+function ttmlTimeToSec(t) {
+  const parts = String(t || '0').split(':').map(Number);
+  let sec = 0;
+  for (const p of parts) sec = sec * 60 + (isNaN(p) ? 0 : p);
+  return sec;
+}
+
+function fmtLrcTime(sec) {
+  const m = Math.floor(sec / 60);
+  const s = sec - m * 60;
+  return '[' + String(m).padStart(2, '0') + ':' + s.toFixed(2).padStart(5, '0') + ']';
+}
+
+function ttmlToLrc(ttml) {
+  const lines = [];
+  const re = /<p\b[^>]*begin="([^"]+)"[^>]*>([\s\S]*?)<\/p>/g;
+  let m;
+  while ((m = re.exec(ttml))) {
+    const text = decodeEntities(m[2].replace(/<[^>]+>/g, '').trim());
+    lines.push(fmtLrcTime(ttmlTimeToSec(m[1])) + text);
   }
-  return { status: 'none', lrc: null };
+  return lines.length ? lines.join('\n') + '\n' : null;
+}
+
+async function betterLyricsLrc(track, durSec) {
+  const q = new URLSearchParams({ s: track.name, a: firstArtist(track.artist) || track.artist });
+  if (track.album) q.set('al', track.album);
+  if (durSec > 0) q.set('d', String(durSec));
+  const r = await httpsRequest('https://api.betterlyrics.org/getLyrics?' + q.toString(), {
+    headers: { 'User-Agent': USER_AGENT },
+    timeout: 12000,
+  });
+  if (r.status !== 200 || !r.json || !r.json.ttml) return null; // 401 = not cached
+  return ttmlToLrc(r.json.ttml);
+}
+
+// ---------------------------------------------------------------------------
+// Provider 3: KuGou Music (free, no key) — lyrics.kugou.com search + download
+// returns base64-encoded LRC. Strong on Western/Chinese catalog.
+// ---------------------------------------------------------------------------
+
+async function kuGouLrc(track) {
+  const durMs = Math.round(track.duration_ms || 0);
+  const keyword = encodeURIComponent(track.name + ' - ' + (firstArtist(track.artist) || track.artist));
+  let url = 'https://lyrics.kugou.com/search?ver=1&man=yes&client=pc&keyword=' + keyword;
+  if (durMs > 0) url += '&duration=' + durMs;
+  const r = await httpsRequest(url, { headers: { 'User-Agent': USER_AGENT }, timeout: 12000 });
+  const cands = (r.json && r.json.candidates) || [];
+  if (!cands.length) return null;
+  let pick = cands[0];
+  if (durMs > 0) {
+    const wantSec = durMs / 1000;
+    const close = cands.find((c) => Math.abs((c.duration || 0) - wantSec) <= 10);
+    if (close) pick = close;
+  }
+  if (!pick.id || !pick.accesskey) return null;
+  const d = await httpsRequest(
+    `https://lyrics.kugou.com/download?fmt=lrc&charset=utf8&client=pc&ver=1&id=${pick.id}&accesskey=${pick.accesskey}`,
+    { headers: { 'User-Agent': USER_AGENT }, timeout: 12000 }
+  );
+  if (!d.json || !d.json.content) return null;
+  let lrc;
+  try { lrc = Buffer.from(d.json.content, 'base64').toString('utf-8'); }
+  catch (_) { return null; }
+  // keep only real timestamped lines, drop KuGou's junk tags ([id:0], [sign:...] etc.)
+  const lines = lrc.split('\n')
+    .filter((ln) => /^\s*\[\d{1,3}:\d{2}[.:]/.test(ln))
+    .map((ln) => decodeEntities(ln));
+  if (!lines.length) return null;
+  return lines.join('\n') + '\n';
+}
+
+// ---------------------------------------------------------------------------
+// Chain: LRCLIB -> BetterLyrics -> KuGou -> lrclib plain/instrumental fallback
+// ---------------------------------------------------------------------------
+
+async function fetchLyricsForTrack(track) {
+  const durSec = Math.round((track.duration_ms || 0) / 1000);
+  const fa = firstArtist(track.artist);
+  let plainFallback = null;  // lrclib plain lyrics (2nd weakest)
+  let instrFallback = null;  // lrclib instrumental flag (weakest — flag is sometimes wrong)
+
+  const consider = (r) => {
+    if (!r || r.status === 'none') return false;
+    if (r.status === 'synced') return true; // caller returns immediately
+    if (r.status === 'plain' && !plainFallback) plainFallback = r;
+    if (r.status === 'instrumental' && !instrFallback) instrFallback = r;
+    return false;
+  };
+
+  // 1) lrclib exact lookups — several metadata variants, because album or
+  //    multi-artist mismatches are the #1 reason exact lookup misses.
+  const variants = [[track.artist, track.album], [fa, track.album], [fa, '']];
+  const seen = new Set();
+  for (const [artist, album] of variants) {
+    const key = artist + '|' + album;
+    if (!artist || seen.has(key)) continue;
+    seen.add(key);
+    let d = null;
+    try { d = await lrclibGet(track.name, artist, album, durSec); } catch (_) { /* next */ }
+    if (d && (d.syncedLyrics || d.plainLyrics || d.instrumental)) {
+      const r = buildLrc(track, d.syncedLyrics, d.plainLyrics, d.instrumental, 'LRCLIB');
+      if (r.status === 'synced') return r;
+      consider(r);
+    }
+    await sleep(250); // stay polite to the free API between attempts
+  }
+
+  // 2) lrclib smart keyword-search fallback
+  try {
+    const hit = await lrclibSearchBest(track);
+    if (hit && (hit.syncedLyrics || hit.plainLyrics || hit.instrumental)) {
+      const r = buildLrc(track, hit.syncedLyrics, hit.plainLyrics, hit.instrumental, 'LRCLIB');
+      if (r.status === 'synced') return r;
+      consider(r);
+    }
+  } catch (_) { /* next provider */ }
+
+  // 3+4) BetterLyrics (Apple Music TTML) + KuGou in parallel —
+  // first synced result wins (Apple Music preferred on ties)
+  try {
+    const [b, k] = await Promise.all([
+      betterLyricsLrc(track, durSec).catch(() => null),
+      kuGouLrc(track).catch(() => null),
+    ]);
+    if (b) return { status: 'synced', lrc: lrcHeader(track) + b, source: 'Apple Music' };
+    if (k) return { status: 'synced', lrc: lrcHeader(track) + k, source: 'KuGou' };
+  } catch (_) { /* fall through */ }
+
+  // 5) last resort: lrclib plain, then instrumental
+  if (plainFallback) return plainFallback;
+  if (instrFallback) return instrFallback;
+  return { status: 'none', lrc: null, source: null };
 }
 
 async function fetchLyricsBatch(tracks, onProgress, throttleMs) {
@@ -268,4 +427,9 @@ module.exports = {
   resolveSpotify,
   fetchLyricsForTrack,
   fetchLyricsBatch,
+  firstArtist,
+  ttmlToLrc,
+  betterLyricsLrc,
+  kuGouLrc,
+  lrcHeader,
 };

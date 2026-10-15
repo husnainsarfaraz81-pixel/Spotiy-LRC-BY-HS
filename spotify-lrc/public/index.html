@@ -104,7 +104,7 @@ const $ = (id) => document.getElementById(id);
 // Local (node server.js) vs hosted (Netlify): API ka raasta khud chun lo
 const IS_LOCAL = location.hostname === 'localhost' || location.hostname === '127.0.0.1';
 const api = (name) => IS_LOCAL ? '/api/' + name : '/.netlify/functions/' + name;
-const FETCH_CHUNK = IS_LOCAL ? 25 : 5; // Netlify free functions ~10s me timeout hote hain
+const FETCH_CHUNK = IS_LOCAL ? 25 : 3; // Netlify free functions ~10s me timeout hote hain (3-provider chain ab thoda slow hai)
 const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 
 // ---- keys ----
@@ -190,11 +190,12 @@ async function fetchAllLyrics() {
   $('sumline').textContent = `${ok}/${LYRICS.length} tracks ke lyrics mil gaye`;
 }
 
-function badge(st) {
+function badge(st, src) {
   const m = { synced: ['b-synced', '✓ Synced'], plain: ['b-plain', '◐ Plain'], instrumental: ['b-inst', '♪ Instrumental'],
               none: ['b-none', '✗ Not found'], error: ['b-none', '⚠ Error'] };
   const b = m[st] || ['b-wait', '…'];
-  return `<span class="badge ${b[0]}">${b[1]}</span>`;
+  const s = (st === 'synced' && src) ? ` <span style="opacity:.65;font-weight:400">· ${esc(src)}</span>` : '';
+  return `<span class="badge ${b[0]}">${b[1]}${s}</span>`;
 }
 
 function renderTable(loading) {
@@ -202,7 +203,7 @@ function renderTable(loading) {
   TRACKS.forEach((t, i) => {
     const L = LYRICS[i];
     h += `<tr><td>${i + 1}</td><td>${esc(t.name)}</td><td>${esc(t.artist)}</td><td>${t.duration_ms ? fmtDur(t.duration_ms) : '–'}</td>`;
-    h += `<td>${L ? badge(L.status) : (loading ? badge('wait') : '')}</td><td style="white-space:nowrap">`;
+    h += `<td>${L ? badge(L.status, L.source) : (loading ? badge('wait') : '')}</td><td style="white-space:nowrap">`;
     if (L && L.lrc) {
       h += `<button class="ghost" onclick="togglePrev(${i})">Preview</button> <button class="ghost" onclick="dlOne(${i})">⬇ .lrc</button>`;
     }
