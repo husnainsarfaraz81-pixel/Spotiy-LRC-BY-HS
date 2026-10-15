@@ -1,0 +1,6 @@
+# Netlify deploy config (free tier is enough)
+[build]
+  publish = "public"
+  functions = "netlify/functions"
+
+# No build command needed — plain static frontend + Node functions, zero deps.
